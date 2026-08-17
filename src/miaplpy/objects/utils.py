@@ -6,13 +6,14 @@
 import os
 import shutil
 import glob
+import shlex
 from mintpy.objects.coord import coordinate
 import h5py
 from osgeo import gdal
 import datetime
 import re
 import numpy as np
-from miaplpy.objects.arg_parser import MiaplPyParser
+from miaplpy.objects.arg_parser import MiaplPyParser, resolve_miaplpy_source_paths
 from mintpy.utils import readfile, ptime, utils as ut
 from mintpy.objects import (
     DSET_UNIT_DICT,
@@ -46,6 +47,24 @@ datasetName2templateKey = {'slc': 'miaplpy.load.slcFile',
                                'bperp': 'miaplpy.load.bperpFile'
                                }
 
+
+
+def normalize_compression(value):
+    """Translate template compression values into h5py-compatible values."""
+    if value is None or value is False:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in {'auto', 'default', 'no', 'none', 'false', ''}:
+            return None
+        if value in {'gzip', 'lzf'}:
+            return value
+
+    raise ValueError(
+        'Unsupported miaplpy.load.compression value {!r}; '
+        'use gzip, lzf, no, or auto.'.format(value)
+    )
 
 
 class OutControl:
@@ -493,8 +512,11 @@ def check_template_auto_value(templateDict, mintpyTemplateDict=None, auto_file='
                 status = 'run'
         for key in common_keys:
             if templateDict['miaplpy.' + key] == 'no':
-                if not mintpyTemplateDict['mintpy.' + key] in ['no', False]:
-                    templateDict['miaplpy.' + key] = mintpyTemplateDict['mintpy.' + key]
+                mintpy_value = mintpyTemplateDict['mintpy.' + key]
+                if key == 'load.compression' and str(mintpy_value).lower() == 'default':
+                    mintpy_value = 'no'
+                if not mintpy_value in ['no', False]:
+                    templateDict['miaplpy.' + key] = mintpy_value
                     status = 'run'
 
         if not templateDict['miaplpy.load.processor'] == mintpyTemplateDict['mintpy.load.processor']:
@@ -1239,7 +1261,7 @@ def update_or_skip_inversion(inverted_date_list, slc_dates):
     return updated_index, all_date_list
 
 
-def read_initial_info(work_dir, templateFile):
+def read_initial_info(work_dir, templateFile, return_baselines=False):
     from miaplpy.objects.slcStack import slcStack
     #import miaplpy.workflow
 
@@ -1251,6 +1273,12 @@ def read_initial_info(work_dir, templateFile):
         date_list = slcObj.get_date_list()
         metadata = slcObj.get_metadata()
         num_pixels = int(metadata['LENGTH']) * int(metadata['WIDTH'])
+        baselines = None
+        if slcObj.pbase is not None:
+            baselines = {
+                date: float(value)
+                for date, value in zip(date_list, slcObj.pbase)
+            }
     else:
         scp_args = '--template {}'.format(templateFile)
         scp_args += ' --project_dir {} --work_dir {}'.format(os.path.dirname(work_dir), work_dir)
@@ -1263,8 +1291,16 @@ def read_initial_info(work_dir, templateFile):
         box = metadata['box']
         num_pixels = (box[2] - box[0]) * (box[3] - box[1])
         stackObj = read_inps_dict2slc_stack_dict_object(iDict)
+        if stackObj is None:
+            raise RuntimeError(
+                'No SLC files were loaded. Check miaplpy.load.slcFile and its '
+                'path relative to the work directory or custom template.'
+            )
         date_list = stackObj.get_date_list()
+        baselines = getattr(stackObj, 'bperp', None)
 
+    if return_baselines:
+        return date_list, num_pixels, metadata, baselines
     return date_list, num_pixels, metadata
 
 
@@ -1284,6 +1320,7 @@ def read_inps2dict(inps):
     for fname in inps.template_file:
         temp = readfile.read_template(fname)
         temp = check_template_auto_value(temp, auto_file=auto_template)
+        temp = resolve_miaplpy_source_paths(temp, fname, inps.work_dir)
         template.update(temp)
     for key, value in template.items():
         inpsDict[key] = value
@@ -1301,8 +1338,7 @@ def read_inps2dict(inps):
         elif value:
             inpsDict[prefix + key] = template[prefix + key]
 
-    if not 'compression' in inpsDict or inpsDict['compression'] == False:
-        inpsDict['compression'] = None
+    inpsDict['compression'] = normalize_compression(inpsDict.get('compression'))
 
     inpsDict['xstep'] = inpsDict.get('xstep', 1)
     inpsDict['ystep'] = inpsDict.get('ystep', 1)
@@ -1346,7 +1382,32 @@ def prepare_metadata(inpsDict):
     script_name = 'prep_slc_{}.py'.format(processor)
     print('-' * 50)
     print('prepare metadata files for {} products'.format(processor))
-    if processor in ['gamma', 'roipac', 'snap']:
+    if processor == 'gamma':
+        from miaplpy import prep_slc_gamma
+
+        def expand_required_files(key):
+            pattern = str(inpsDict[key])
+            files = sorted(glob.glob(pattern, recursive=True))
+            if not files:
+                raise FileNotFoundError(
+                    f'No files found for {key}: {pattern}\n'
+                    'Check the path relative to the MiaplPy work directory or '
+                    'the custom template file.'
+                )
+            return files
+
+        slc_files = expand_required_files('miaplpy.load.slcFile')
+        dem_files = expand_required_files('miaplpy.load.demFile')
+        lookup_files = expand_required_files('miaplpy.load.lookupXFile')
+        prep_args = [
+            '-s', *slc_files,
+            '-r', *dem_files,
+            '-g', *lookup_files,
+        ]
+        print(shlex.join([script_name, *prep_args]))
+        prep_slc_gamma.main(prep_args)
+
+    elif processor in ['roipac', 'snap']:
         slc_files = inpsDict['miaplpy.load.slcFile']
         dem_file = inpsDict['miaplpy.load.demFile']
         lookup_file = inpsDict['miaplpy.load.lookupXFile']
@@ -1524,13 +1585,16 @@ def read_inps_dict2slc_stack_dict_object(inpsDict):
     dsNameList = list(dsPathDict.keys())
     pairsDict = {}
 
-    bperp = {} # for gamma
+    bperp = {}
     for dsPath in dsPathDict[dsName0]:
         if processor in ['gamma', 'roipac', 'snap']:
             dates = ptime.yyyymmdd(read_attribute(dsPath, metafile_ext='.rsc')['DATE'])
-            ### read baselines
-            baseline_file = glob.glob(os.path.join(inpsDict['miaplpy.load.baselineDir'], f'*{dates}*.base_perp'))[0]
-            bperp[dates] = read_gamma_bperp(baseline_file)
+            if processor in ['roipac', 'snap']:
+                baseline_file = glob.glob(os.path.join(
+                    inpsDict['miaplpy.load.baselineDir'],
+                    f'*{dates}*.base_perp',
+                ))[0]
+                bperp[dates] = read_gamma_bperp(baseline_file)
         else:
             dates = ptime.yyyymmdd(read_attribute(dsPath.split('.xml')[0], metafile_ext='.rsc')['DATE'])
         date_val = datetime.datetime.strptime(dates, '%Y%m%d')
@@ -1567,7 +1631,18 @@ def read_inps_dict2slc_stack_dict_object(inpsDict):
     else:
         stackObj = None
 
-    if processor in ['gamma', 'roipac', 'snap']:
+    if processor == 'gamma' and stackObj is not None:
+        from miaplpy.find_short_baselines import get_baselines_dict
+
+        baseline_dir = inpsDict.get('miaplpy.load.baselineDir')
+        bperp_file = inpsDict.get('miaplpy.load.bperpFile')
+        stackObj.bperp = get_baselines_dict(
+            baseline_dir,
+            processor='gamma',
+            bperp_file=bperp_file,
+            date_list=sorted(pairsDict),
+        )[0]
+    elif processor in ['roipac', 'snap'] and stackObj is not None:
         stackObj.bperp = bperp
 
     return stackObj

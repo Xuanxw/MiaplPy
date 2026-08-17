@@ -1,0 +1,35 @@
+miaplpy.load.processor = gamma
+miaplpy.load.updateMode = auto   #if HDF5 files are complete
+miaplpy.load.compression = lzf
+miaplpy.load.autoPath = no
+
+### data path
+miaplpy.load.slcFile = ../RSLC_CROP/*.rslc
+miaplpy.load.baselineDir = ../baselines/
+miaplpy.load.demFile = ../CROP_GEOCODE/geometry/*.rdc.dem
+miaplpy.load.lookupYFile = ../CROP_GEOCODE/geometry/*.UTM_TO_RDC
+miaplpy.load.lookupXFile = ../CROP_GEOCODE/geometry/*.UTM_TO_RDC
+miaplpy.load.bperpFile = ../interferograms/*/*.base_perp
+
+### subset
+### *** CAUTION: currently subsetting gamma data is not supported.                 ***
+### *** miaplpy.subset.yx parameters must be identical to the slc file dimensions. ***
+### *** Check the .par file to find the values                                     ***
+### *** range_samples:                  2250                                       ***
+### *** azimuth_lines:                   500                                       ***
+miaplpy.subset.yx  = 0:2319,0:2306    # must be from 0:line,0:pixels. Currently subsetting is not supported.
+### miaplpy.subset.lalo              # ***currently not supported for gamma data***
+
+
+# MiaplPy options
+#miaplpy.multiprocessing.numProcessor = 10
+miaplpy.interferograms.networkType = single_reference
+
+
+## Mintpy options
+mintpy.compute.cluster     = local  # if dask is not available, set this option to no
+mintpy.compute.numWorker   = 8
+mintpy.reference.lalo     = auto
+mintpy.deramp = linear
+mintpy.deramp.maskFile = maskTempCoh.h5
+mintpy.troposphericDelay.method = auto

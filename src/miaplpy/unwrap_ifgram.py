@@ -19,8 +19,10 @@ def enablePrint():
     sys.stdout = sys.__stdout__
 
 blockPrint()
-# import isce
-# import isceobj
+# Importing the top-level conda-forge ISCE2 package initializes the component
+# search paths used by isceobj and contrib.
+import isce
+import isceobj
 from isceobj.Util.ImageUtil import ImageLib as IML
 from contrib.UnwrapComp.unwrapComponents import UnwrapComponents
 from miaplpy.objects.arg_parser import MiaplPyParser
@@ -31,6 +33,7 @@ import glob
 import time
 import datetime
 enablePrint()
+
 
 def main(iargs=None):
     """
@@ -57,7 +60,6 @@ def main(iargs=None):
     inps.work_dir = os.path.dirname(inps.input_ifg)
 
     if not os.path.exists(inps.work_dir + '/filt_fine.unw.conncomp.vrt'):
-       
         unwObj = Snaphu(inps)
         do_tiles, metadata = unwObj.need_to_split_tiles()
 
@@ -69,8 +71,7 @@ def main(iargs=None):
                 #print('2')
                 unwObj.unwrap()
 
-        except:
-            #print('3')
+        except (subprocess.CalledProcessError, OSError):
             runUnwrap(inps.input_ifg, inps.unwrapped_ifg, inps.input_cor, metadata, inps.unwrap_2stage)
 
     if inps.unwrap_2stage:
@@ -183,16 +184,13 @@ class Snaphu:
 
     def unwrap(self):
 
-        cmd = 'snaphu -f {config_file} -d {wrapped_file} {line_length} -o ' \
-              '{unwrapped_file}'.format(config_file=self.config_file, wrapped_file=self.inp_wrapped,
-                                        line_length=self.width, unwrapped_file=self.out_unwrapped)
+        cmd = [
+            'snaphu', '-f', self.config_file, '-g', self.conncomp, '-d',
+            self.inp_wrapped, str(self.width), '-o', self.out_unwrapped,
+        ]
 
-        print(cmd)
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output, error = p.communicate()
-        print(error)
-        if 'ERROR' in error.decode('UTF-8') or 'Error' in error.decode('UTF-8'): # or len(error.decode('UTF-8'))>0:
-            raise RuntimeError(error)
+        print(' '.join(cmd))
+        subprocess.run(cmd, check=True)
 
 
         
@@ -208,19 +206,14 @@ class Snaphu:
 
     def unwrap_tile(self):
 
-        cmd = 'snaphu -f {config_file} -d {wrapped_file} {line_length} -o ' \
-              '{unwrapped_file} --tile {ytile} {xtile} 400 400 ' \
-              '--nproc {num_proc}'.format(config_file=self.config_file, wrapped_file=self.inp_wrapped,
-                                          line_length=self.width, unwrapped_file=self.out_unwrapped, ytile=self.y_tile,
-                                          xtile=self.x_tile, num_proc=self.num_tiles)
-        print(cmd)
-        
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output, error = p.communicate()
-        print(error)
-
-        if 'ERROR' in error.decode('UTF-8') or 'Error' in error.decode('UTF-8'):  # or len(error.decode('UTF-8'))>0:
-           raise RuntimeError(error)  
+        cmd = [
+            'snaphu', '-f', self.config_file, '-g', self.conncomp, '-d',
+            self.inp_wrapped, str(self.width), '-o', self.out_unwrapped,
+            '--tile', str(self.y_tile), str(self.x_tile), '400', '400',
+            '--nproc', str(self.num_tiles),
+        ]
+        print(' '.join(cmd))
+        subprocess.run(cmd, check=True)
         
         if os.path.exists(self.out_unwrapped):
   

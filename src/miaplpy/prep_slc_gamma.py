@@ -10,29 +10,16 @@ import sys
 import warnings
 import logging
 import argparse
+import datetime
 from mintpy.prep_gamma import (get_lalo_ref, extract_metadata4geometry_radar, extract_metadata4geometry_geo)
 from mintpy.utils import readfile as mt_readfile
+from mintpy.utils import writefile
+from miaplpy.objects.utils import read_attribute
 
 warnings.filterwarnings("ignore")
 
 mpl_logger = logging.getLogger('matplotlib')
 mpl_logger.setLevel(logging.WARNING)
-
-
-# Disable
-def blockPrint():
-    sys.stdout = open(os.devnull, 'w')
-
-
-# Restore
-def enablePrint():
-    sys.stdout = sys.__stdout__
-
-
-blockPrint()
-from mintpy.utils import writefile
-from miaplpy.objects.utils import read_attribute
-enablePrint()
 
 
 EXAMPLE = """example:
@@ -61,7 +48,7 @@ def create_parser():
 
 def cmd_line_parse(iargs=None):
     parser = create_parser()
-    inps = parser.parse_args()
+    inps = parser.parse_args(args=iargs)
     inps = vars(inps)
     if all(not i for i in [inps['slc_files'], inps['radar_geom_files'], inps['geo_geom_files']]):
         parser.print_usage()
@@ -145,8 +132,25 @@ def read_gamma_slc_par(fname, delimiter=':', skiprows=3):
             value = str.replace(c[1], '\n', '').split("#")[0].split()[0].strip()
             parDict[key] = value
             if key.lower() == 'date':
-                value = ''.join(str.replace(c[1], '\n', '').split("#")[0].split()[0:3])
-                parDict[key] = value
+                date_fields = str.replace(c[1], '\n', '').split("#")[0].split()
+                try:
+                    if len(date_fields) >= 3:
+                        date_value = datetime.date(
+                            int(date_fields[0]),
+                            int(date_fields[1]),
+                            int(date_fields[2]),
+                        )
+                    elif len(date_fields) == 1:
+                        date_value = datetime.datetime.strptime(
+                            date_fields[0], '%Y%m%d'
+                        ).date()
+                    else:
+                        raise ValueError('date field is empty')
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f'Invalid GAMMA date in {fname}: {" ".join(date_fields)!r}'
+                    ) from exc
+                parDict[key] = date_value.strftime('%Y%m%d')
 
     parDict = mt_readfile._attribute_gamma2roipac(parDict)
     parDict = mt_readfile.standardize_metadata(parDict)

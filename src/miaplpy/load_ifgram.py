@@ -14,6 +14,7 @@ import datetime
 import importlib
 
 import h5py
+import numpy as np
 from mintpy.objects import (GEOMETRY_DSET_NAMES,
                             geometry,
                             IFGRAM_DSET_NAMES,
@@ -22,7 +23,11 @@ from mintpy.objects import (GEOMETRY_DSET_NAMES,
 from mintpy import load_data as mld
 from mintpy.utils import readfile, ptime, utils as ut
 from miaplpy.defaults import auto_path
-from miaplpy.objects.utils import check_template_auto_value, read_subset_template2box
+from miaplpy.objects.utils import (
+    check_template_auto_value,
+    normalize_compression,
+    read_subset_template2box,
+)
 
 
 
@@ -43,6 +48,50 @@ datasetName2templateKey = {'unwrapPhase'     : 'miaplpy.load.unwFile',
                            'waterMask'       : 'miaplpy.load.waterMaskFile',
                            'bperp'           : 'miaplpy.load.bperpFile'
                            }
+
+
+class _IfgramReadAdapter:
+    """Adapt MintPy's ifgram reader to MiaplPy's complex wrapped files."""
+
+    def __init__(self, ifgram_obj):
+        self._ifgram_obj = ifgram_obj
+
+    def __getattr__(self, name):
+        return getattr(self._ifgram_obj, name)
+
+    def read(self, family, *args, **kwargs):
+        data, metadata = self._ifgram_obj.read(family, *args, **kwargs)
+        if family == 'wrapPhase' and np.iscomplexobj(data):
+            # MintPy stores wrapPhase in radians as float32, while MiaplPy's
+            # filt_fine.int is a unit complex interferogram.
+            data = np.angle(data).astype(np.float32, copy=False)
+        return data, metadata
+
+
+def adapt_complex_wrap_phase(stack_obj):
+    """Wrap all pair readers so complex interferograms become phase radians."""
+    if stack_obj is not None:
+        stack_obj.pairsDict = {
+            pair: _IfgramReadAdapter(ifgram_obj)
+            for pair, ifgram_obj in stack_obj.pairsDict.items()
+        }
+    return stack_obj
+
+
+def copy_available_geometry_files(source_dir, destination_dir):
+    """Copy all available radar/geocoded geometry files into the network."""
+    copied = 0
+    os.makedirs(destination_dir, exist_ok=True)
+    for filename in ['geometryRadar.h5', 'geometryGeo.h5']:
+        source = os.path.join(source_dir, filename)
+        destination = os.path.join(destination_dir, filename)
+        if not os.path.isfile(source):
+            continue
+        if (not os.path.isfile(destination)
+                or os.path.getmtime(source) > os.path.getmtime(destination)):
+            shutil.copy2(source, destination)
+        copied += 1
+    return copied
 
 DEFAULT_TEMPLATE = """template:
 ########## 1. Load ifgrams (--load to exit after this step)
@@ -138,6 +187,14 @@ def cmd_line_parse(iargs=None):
 
 
 #################################################################
+def gamma_subset_yx_to_box(subset_yx):
+    """Convert GAMMA ``y0:y1,x0:x1`` text into MintPy's x/y box order."""
+    y_range, x_range = [
+        list(map(int, part.split(':'))) for part in subset_yx.split(',')
+    ]
+    return (x_range[0], y_range[0], x_range[1], y_range[1])
+
+
 def read_inps2dict(inps):
     """Read input Namespace object info into inpsDict"""
     # Read input info into inpsDict
@@ -167,8 +224,7 @@ def read_inps2dict(inps):
         elif value:
             inpsDict[prefix + key] = template[prefix + key]
 
-    if not 'compression' in inpsDict or inpsDict['compression'] == False:
-        inpsDict['compression'] = None
+    inpsDict['compression'] = normalize_compression(inpsDict.get('compression'))
 
     inpsDict['xstep'] = inpsDict.get('xstep', 1)
     inpsDict['ystep'] = inpsDict.get('ystep', 1)
@@ -206,8 +262,7 @@ def read_subset_box(inpsDict):
 
     # TODO: Shouldn't pix_box be the same as the slcStack? Check this to make sure
     if inpsDict['processor'].lower() == 'gamma':
-        y_range, x_range = [list(map(int, part.split(':'))) for part in inpsDict['miaplpy.subset.yx'].split(',')]
-        pix_box = (*y_range, *x_range)
+        pix_box = gamma_subset_yx_to_box(inpsDict['miaplpy.subset.yx'])
 
     # Grab required info to read input geo_box into pix_box
     try:
@@ -417,6 +472,7 @@ def main(iargs=None):
     elif 'miaplpy.load.ionUnwFile' in datasetName2templateKey.values():
         datasetName2templateKey['ionMintPy'] = 'mintpy.load.ionUnwFile'
     stackObj = mld.read_inps_dict2ifgram_stack_dict_object(inpsDict, datasetName2templateKey)
+    stackObj = adapt_complex_wrap_phase(stackObj)
 
     # prepare wirte
     updateMode, comp, box, boxGeo = print_write_setting(inpsDict)
@@ -437,18 +493,11 @@ def main(iargs=None):
                             compression=comp,
                             extra_metadata=extraDict)
 
-    geo_files = ['geometryRadar.h5', 'geometryGeo.h5']
-    copy_file = False
-    for geometry_file_2 in geo_files:
-        geometry_file = os.path.join(os.path.dirname(work_dir), 'inputs', geometry_file_2)
-        if os.path.exists(geometry_file):
-            copy_file = True
-            break
-
-    if copy_file:
-        if not os.path.exists(os.path.join(work_dir, 'inputs/{}'.format(geometry_file_2))):
-            shutil.copyfile(geometry_file, os.path.join(work_dir, 'inputs/{}'.format(geometry_file_2)))
-    else:
+    num_geometry_files = copy_available_geometry_files(
+        source_dir=os.path.join(os.path.dirname(work_dir), 'inputs'),
+        destination_dir=os.path.join(work_dir, 'inputs'),
+    )
+    if num_geometry_files == 0:
         geomRadarObj, geomGeoObj = mld.read_inps_dict2geometry_dict_object(inpsDict)
         if geomRadarObj and mld.run_or_skip(inps.outfile[1], geomRadarObj, box,
                                           updateMode=updateMode,
@@ -507,7 +556,9 @@ def main(iargs=None):
         msg = 'step load_ifgram: NOT all required dataset found, exit.'
         raise SystemExit(msg)
 
-    return inps.outfile
+    # Console entry points call sys.exit(main()). Returning a list makes Python
+    # print it and exit with status 1 even after a successful load.
+    return 0
 
 
 #################################################################

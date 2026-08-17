@@ -35,6 +35,7 @@ miaplpyApp = "miaplpy.miaplpyApp:main"
 'tcoh_view.py' = "miaplpy.tcoh_view:main"
 'generate_ifgram.py' = "miaplpy.generate_ifgram:main"
 'unwrap_ifgram.py' = "miaplpy.unwrap_ifgram:main"
+'residual_troposphere.py' = "miaplpy.residual_troposphere:main"
 
 
 [tool.setuptools.packages.find]

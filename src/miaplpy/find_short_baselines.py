@@ -3,10 +3,13 @@
 
 import os
 import glob
+import re
+import warnings
 import numpy as np
 import argparse
 from datetime import datetime, timedelta
 from scipy.spatial import Delaunay
+from mintpy.utils import ptime
 
 def cmd_line_parse(iargs=None):
     parser = argparse.ArgumentParser(description='find the minimum number of connected good interferograms')
@@ -27,10 +30,13 @@ def cmd_line_parse(iargs=None):
     return inps
 
 
-def find_baselines(iargs=None):
+def find_baselines(iargs=None, baselines=None, dates0=None):
     inps = cmd_line_parse(iargs)
 
-    baselines, dates0 = get_baselines_dict(inps.baseline_dir)
+    if baselines is None:
+        baselines, dates0 = get_baselines_dict(inps.baseline_dir)
+    elif dates0 is None:
+        dates0 = sorted(baselines)
     with open(inps.date_list, 'r') as f:
         date_list = f.readlines()
         date_list = [dd.split('\n')[0] for dd in date_list]
@@ -109,7 +115,193 @@ def find_baselines(iargs=None):
     return
 
 
-def get_baselines_dict(baseline_dir):
+def _get_gamma_bperp_files(baseline_dir=None, bperp_file=None):
+    """Find projected GAMMA pair-baseline files from a pattern or directory."""
+    special_values = {None, '', 'auto', 'none', 'no', 'false'}
+    bperp_value = str(bperp_file).lower() if bperp_file is not None else None
+    files = []
+
+    if bperp_value not in special_values:
+        patterns = bperp_file if isinstance(bperp_file, (list, tuple)) else [bperp_file]
+        for pattern in patterns:
+            pattern = os.path.abspath(os.path.expanduser(str(pattern)))
+            if os.path.isdir(pattern):
+                files.extend(glob.glob(os.path.join(pattern, '**', '*.base_perp'), recursive=True))
+            else:
+                files.extend(glob.glob(pattern, recursive=True))
+    elif baseline_dir and os.path.isdir(baseline_dir):
+        files = glob.glob(os.path.join(baseline_dir, '**', '*.base_perp'), recursive=True)
+
+    files = sorted(set(
+        os.path.abspath(fname)
+        for fname in files
+        if os.path.isfile(fname) and str(fname).endswith('.base_perp')
+    ))
+    if not files:
+        source = bperp_file if bperp_value not in special_values else baseline_dir
+        raise FileNotFoundError(
+            f'No GAMMA .base_perp files found from: {source}\n'
+            'Set miaplpy.load.bperpFile to the pairwise .base_perp pattern. '
+            'A .baseline file alone is not a projected perpendicular baseline.'
+        )
+    return files
+
+
+def _gamma_date_pair_from_path(fname):
+    """Extract and normalize the ordered date pair from a GAMMA file path."""
+    date_pair_pattern = re.compile(
+        r'(?<!\d)(\d{8}|\d{6})[-_](\d{8}|\d{6})(?!\d)'
+    )
+    for value in reversed(os.path.normpath(fname).split(os.sep)):
+        match = date_pair_pattern.search(value)
+        if match:
+            return tuple(ptime.yyyymmdd(date) for date in match.groups())
+    raise ValueError(f'Cannot find a date pair in GAMMA baseline path: {fname}')
+
+
+def get_gamma_baselines_dict(bperp_files, date_list=None, residual_tolerance=None):
+    """Solve acquisition baselines from pairwise GAMMA perpendicular baselines.
+
+    Each pair file supplies the equation ``B(date2) - B(date1) = bperp``.
+    The earliest requested acquisition is fixed at zero because only baseline
+    differences are physically relevant to the downstream workflow.
+    """
+    if isinstance(bperp_files, (str, os.PathLike)):
+        bperp_files = glob.glob(os.fspath(bperp_files), recursive=True)
+    bperp_files = sorted(set(os.path.abspath(fname) for fname in bperp_files))
+
+    requested_dates = None
+    if date_list is not None:
+        requested_dates = sorted({ptime.yyyymmdd(str(date)) for date in date_list})
+    if requested_dates is not None and len(requested_dates) == 1:
+        return {requested_dates[0]: 0.0}
+
+    path_pairs = [(*_gamma_date_pair_from_path(fname), fname) for fname in bperp_files]
+    all_dates = sorted({date for date1, date2, _ in path_pairs for date in [date1, date2]})
+    if not all_dates:
+        raise ValueError('No acquisition dates are available for GAMMA baseline solving.')
+
+    neighbors = {date: set() for date in all_dates}
+    for date1, date2, _ in path_pairs:
+        neighbors[date1].add(date2)
+        neighbors[date2].add(date1)
+
+    components = []
+    unseen = set(all_dates)
+    while unseen:
+        pending = [min(unseen)]
+        component = set()
+        while pending:
+            date = pending.pop()
+            if date in component:
+                continue
+            component.add(date)
+            pending.extend(neighbors[date] - component)
+        unseen -= component
+        components.append(sorted(component))
+
+    if requested_dates is None:
+        relevant_components = components
+    else:
+        missing_dates = sorted(set(requested_dates) - set(all_dates))
+        if missing_dates:
+            raise ValueError(
+                'No GAMMA .base_perp paths contain requested acquisitions: '
+                + ', '.join(missing_dates)
+            )
+        relevant_components = [
+            component for component in components
+            if any(date in component for date in requested_dates)
+        ]
+
+    if len(relevant_components) > 1:
+        raise ValueError(
+            'GAMMA .base_perp network is disconnected; components: '
+            + '; '.join(','.join(component) for component in relevant_components)
+        )
+
+    dates = relevant_components[0]
+    date_set = set(dates)
+    grouped_edges = {}
+    for date1, date2, fname in path_pairs:
+        if date1 not in date_set or date2 not in date_set:
+            continue
+        base_dict = read_gamma_perp_baseline(fname, atr_dict={})
+        value = np.mean([
+            float(base_dict['P_BASELINE_TOP_HDR']),
+            float(base_dict['P_BASELINE_BOTTOM_HDR']),
+        ])
+        if not np.isfinite(value):
+            raise ValueError(f'Non-finite GAMMA baseline value in: {fname}')
+
+        pair = tuple(sorted([date1, date2]))
+        oriented_value = float(value) if (date1, date2) == pair else -float(value)
+        grouped_edges.setdefault(pair, []).append((oriented_value, fname))
+
+    edges = []
+    for (date1, date2), values_and_files in sorted(grouped_edges.items()):
+        values = np.array([item[0] for item in values_and_files], dtype=np.float64)
+        files = [item[1] for item in values_and_files]
+        if np.ptp(values) > 0.1:
+            warnings.warn(
+                f'Duplicate GAMMA baselines for {date1}_{date2} differ by '
+                f'{np.ptp(values):.4f} m; using their mean. Files: {files}'
+            )
+        edges.append((date1, date2, float(np.mean(values)), ', '.join(files)))
+
+    date_index = {date: index for index, date in enumerate(dates)}
+    design = np.zeros((len(edges), len(dates)), dtype=np.float64)
+    observations = np.zeros(len(edges), dtype=np.float64)
+    for row, (date1, date2, value, _) in enumerate(edges):
+        design[row, date_index[date1]] = -1.0
+        design[row, date_index[date2]] = 1.0
+        observations[row] = value
+
+    solution, _, rank, _ = np.linalg.lstsq(design[:, 1:], observations, rcond=None)
+    if rank != len(dates) - 1:
+        raise ValueError(
+            f'GAMMA baseline network rank is {rank}; expected {len(dates) - 1}.'
+        )
+
+    baselines = np.concatenate(([0.0], solution))
+    residuals = design @ baselines - observations
+    worst_index = int(np.argmax(np.abs(residuals)))
+    worst_residual = abs(residuals[worst_index])
+    if residual_tolerance is not None and worst_residual > residual_tolerance:
+        date1, date2, observed, fname = edges[worst_index]
+        predicted = baselines[date_index[date2]] - baselines[date_index[date1]]
+        raise ValueError(
+            'Inconsistent GAMMA baseline network. '
+            f'Worst pair {date1}_{date2} from {fname}: observed={observed:.4f} m, '
+            f'predicted={predicted:.4f} m, residual={residuals[worst_index]:.4f} m.'
+        )
+    if residual_tolerance is None and worst_residual > 0.1:
+        warnings.warn(
+            'GAMMA pair baselines do not close exactly; using the least-squares '
+            f'solution (maximum residual: {worst_residual:.4f} m).'
+        )
+
+    solved = {date: float(baselines[index]) for index, date in enumerate(dates)}
+    output_dates = requested_dates if requested_dates is not None else dates
+    output_reference = solved[output_dates[0]]
+    return {date: solved[date] - output_reference for date in output_dates}
+
+
+def get_baselines_dict(baseline_dir, processor=None, bperp_file=None, date_list=None):
+
+    if processor == 'gamma' and date_list is not None and len(set(date_list)) == 1:
+        date = ptime.yyyymmdd(str(next(iter(date_list))))
+        return {date: 0.0}, [date]
+
+    gamma_files = []
+    if processor == 'gamma' or (bperp_file and str(bperp_file).lower() not in ['auto', 'none', 'no', 'false']):
+        gamma_files = _get_gamma_bperp_files(baseline_dir, bperp_file)
+    elif baseline_dir and os.path.isdir(baseline_dir):
+        gamma_files = glob.glob(os.path.join(baseline_dir, '*.base_perp'))
+
+    if gamma_files:
+        baselines = get_gamma_baselines_dict(gamma_files, date_list=date_list)
+        return baselines, sorted(baselines)
 
     bf = os.listdir(baseline_dir)
     if bf[0].endswith('.base_perp'):
@@ -149,21 +341,33 @@ def get_baselines_dict(baseline_dir):
                     baselines[secondary] = baseline
     return baselines, dates
 
-def read_gamma_perp_baseline(base_perp_file, atr_dict={}):
+def read_gamma_perp_baseline(base_perp_file, atr_dict=None):
     """
     load gamma baselines
     """
+    if atr_dict is None:
+        atr_dict = {}
     bperp_list = []
 
     f = open(base_perp_file)
     lines = f.readlines()
     f.close()
 
-    start_line_idx = [lines.index(i)+2 for i in lines if 'bpara       bperp       blen' in i][0]
+    header_indices = [
+        index for index, line in enumerate(lines)
+        if all(name in line.split() for name in ['bpara', 'bperp', 'blen'])
+    ]
+    if not header_indices:
+        raise ValueError(f'Invalid GAMMA .base_perp file (missing table header): {base_perp_file}')
+
+    start_line_idx = header_indices[0] + 1
     for i in range(start_line_idx, len(lines)):
         c = lines[i].strip().split()
         if len(c) == 9:
             bperp_list.append(float(c[7]))
+
+    if not bperp_list:
+        raise ValueError(f'Invalid GAMMA .base_perp file (no baseline rows): {base_perp_file}')
 
     atr_dict['P_BASELINE_TOP_HDR'] = str(bperp_list[0])
     atr_dict['P_BASELINE_BOTTOM_HDR'] = str(bperp_list[-1])
@@ -222,10 +426,10 @@ def find_short_pbaseline_pair(baselines, date_list, ministack_size, last_index):
     return pair
 
 
-def find_mini_stacks(date_list, baseline_dir, month=6):
+def find_mini_stacks(date_list, baseline_dir, month=6, baselines=None):
     pairs = []
     dates = [datetime.strptime(date_str, '%Y%m%d') for date_str in date_list]
-    bperp = get_baselines_dict(baseline_dir)[0]
+    bperp = baselines if baselines is not None else get_baselines_dict(baseline_dir)[0]
     years = np.array([x.year for x in dates])
     u, indices_first = np.unique(years, return_index=True)
     f_ind = indices_first
@@ -275,5 +479,3 @@ def find_one_year_interferograms(date_list):
 
 if __name__ == '__main__':
     find_baselines()
-
-

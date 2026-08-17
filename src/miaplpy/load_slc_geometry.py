@@ -7,6 +7,7 @@ import os
 import glob
 import sys
 import datetime
+import subprocess
 from mintpy.objects import (GEOMETRY_DSET_NAMES,
                             geometry,
                             sensor)
@@ -137,12 +138,36 @@ def main(iargs=None):
         # run lookup_geo2radar.py to copy lon/lat to radar coordiantes
         script_name = 'lookup_geo2radar.py'
         print('-' * 50)
-        cmd = f'{script_name} geometryGeo.h5'
-        print(cmd)
-        os.system(cmd)
-        os.chdir(this_dir)
+        radar_file = inps.out_file[1]
+        lookup_is_current = False
+        if os.path.isfile(radar_file):
+            with h5py.File(radar_file, 'r') as fobj:
+                lookup_is_current = all(
+                    name in fobj for name in ['latitude', 'longitude']
+                )
+            lookup_is_current &= (
+                os.path.getmtime(radar_file) >= os.path.getmtime(inps.out_file[2])
+            )
 
-    return inps.out_file
+        if lookup_is_current:
+            print('latitude/longitude already exist in an up-to-date '
+                  'geometryRadar.h5; skip lookup_geo2radar.py')
+        else:
+            cmd = [script_name, 'geometryGeo.h5']
+            print(' '.join(cmd))
+            subprocess.run(cmd, check=True)
+        os.chdir(this_dir)
+        num_invalid = sanitize_geometry_radar_lat_lon(radar_file)
+        if num_invalid:
+            print(
+                f'set {num_invalid} non-finite latitude/longitude pixels '
+                'to the MintPy invalid lookup value 0'
+            )
+
+    # Console entry points call sys.exit(main()). Returning the output-file list
+    # makes Python print the list and exit with status 1 even after a successful
+    # write. Use the conventional success status instead.
+    return 0
 
 #################################################################
 
@@ -169,14 +194,42 @@ def add_lonlat_gamma(h5file):
     compression = f['azimuthCoord'].compression
     for data, dsname in zip([lon, lat], ['longitude', 'latitude']):
         if dsname in f.keys():
-            # TODO: add update mode
-            raise Exception(f"name {dsname} already exists in {h5file}. Try deleting the file.")
+            if f[dsname].shape != data.shape:
+                existing_shape = f[dsname].shape
+                f.close()
+                raise ValueError(
+                    f'existing {dsname} shape {existing_shape} does not match '
+                    f'expected shape {data.shape} in {h5file}'
+                )
+            continue
         f.create_dataset(dsname,
                          data=data,
                          dtype='float32',
                          chunks=True,
                          compression=compression)
     f.close()
+
+
+def sanitize_geometry_radar_lat_lon(h5file):
+    """Replace non-finite radar lookup coordinates with MintPy's zero sentinel."""
+    with h5py.File(h5file, 'r+') as fobj:
+        missing = [name for name in ['latitude', 'longitude'] if name not in fobj]
+        if missing:
+            raise KeyError(
+                f'missing lookup dataset(s) {missing} in geometry file: {h5file}'
+            )
+
+        latitude = fobj['latitude'][:]
+        longitude = fobj['longitude'][:]
+        invalid = ~np.isfinite(latitude) | ~np.isfinite(longitude)
+        num_invalid = int(np.count_nonzero(invalid))
+        if num_invalid:
+            latitude[invalid] = 0.0
+            longitude[invalid] = 0.0
+            fobj['latitude'][...] = latitude
+            fobj['longitude'][...] = longitude
+
+    return num_invalid
 #########
 
 def read_inps_dict2geometry_dict_object(inpsDict):
@@ -206,6 +259,11 @@ def read_inps_dict2geometry_dict_object(inpsDict):
     dsPathDict = {}
     for dsName in [i for i in GEOMETRY_DSET_NAMES
                    if i in datasetName2templateKey.keys()]:
+        # GAMMA *.base_perp files contain scalar pair baselines, not the ISCE
+        # 2-D coarse-grid geometry dataset handled below.  They are loaded into
+        # slcStack.h5 by read_inps_dict2slc_stack_dict_object() instead.
+        if inpsDict['processor'] == 'gamma' and dsName == 'bperp':
+            continue
         key = datasetName2templateKey[dsName]
         if key in inpsDict.keys():
             files = sorted(glob.glob(str(inpsDict[key]) + ending))
