@@ -55,7 +55,10 @@ def read_float(path, shape):
 
 
 def command(binary, args, directory):
-    with (directory / (Path(binary).name + '.log')).open('w') as log:
+    log_name = Path(binary).name
+    if log_name == 'fill_gaps':
+        log_name += '_' + Path(str(args[0])).name
+    with (directory / (log_name + '.log')).open('w') as log:
         log.write(json.dumps([str(binary), *map(str, args)]) + '\n')
         log.flush()
         subprocess.run([str(binary), *map(str, args)], cwd=directory,
@@ -66,14 +69,19 @@ class GammaBackend:
     """Adapter for the installed GAMMA 2020 atm_mod_2d/atm_sim_2d interface."""
     def __init__(self, directory):
         self.binaries = {}
-        for name in ('atm_mod_2d', 'atm_sim_2d'):
+        for name in ('atm_mod_2d', 'atm_sim_2d', 'fill_gaps'):
             binary = str(Path(directory) / name) if directory else shutil.which(name)
+            if name == 'fill_gaps' and directory and not os.access(binary, os.X_OK):
+                # GAMMA ships fill_gaps in ISP/bin, the model tools in DIFF/bin.
+                sibling = Path(directory).resolve().parent.parent / 'ISP/bin/fill_gaps'
+                binary = str(sibling) if sibling.is_file() else shutil.which(name)
             if not binary or not os.access(binary, os.X_OK):
                 raise FileNotFoundError(f'{name} is unavailable; set {PREFIX}gammaBin')
             self.binaries[name] = binary
             banner = subprocess.run([binary], capture_output=True, text=True)
             usage = banner.stdout + banner.stderr
-            expected = '[mfrac]' if name == 'atm_mod_2d' else '<a1> <atm_phase>'
+            expected = {'atm_mod_2d': '[mfrac]', 'atm_sim_2d': '<a1> <atm_phase>',
+                        'fill_gaps': '[ds_data]'}[name]
             if expected not in usage or (name == 'atm_sim_2d' and '<model>' in usage):
                 raise RuntimeError(f'Unsupported GAMMA interface: {name}; inspect its usage')
 
@@ -113,18 +121,28 @@ class GammaBackend:
                 (grids['sigma_h'] >= cfg['minHeightStd']))
         if not good.any() or good.mean() < cfg['minValidFraction']:
             raise RuntimeError('Insufficient valid atmospheric model patches / height support')
-        distance, indices = distance_transform_edt(~good, return_indices=True)
+        # Distance is a support check only; interpolation is delegated to GAMMA.
+        distance = distance_transform_edt(~good)
         if distance.max() > cfg['maxFillDistance']:
             raise RuntimeError('Atmospheric model gaps exceed maxFillDistance')
         for name in ('a0', 'a1'):
-            filled = grids[name][tuple(indices)]
-            np.asarray(filled, dtype='>f4').tofile(directory / (name + '_filled'))
+            # Invalid windows use GAMMA's zero-gap convention. Preserve the raw
+            # regression products and each invocation's input/output and log.
+            masked = np.where(good, grids[name], 0)
+            np.asarray(masked, dtype='>f4').tofile(directory / (name + '_masked'))
+            command(self.binaries['fill_gaps'],
+                    [name + '_masked', shape[1], name + '_filled',
+                     '0', '4', '-', '0', '100', '-', '400', '-'], directory)
+            filled = read_float(directory / (name + '_filled'), shape)
+            if not np.isfinite(filled).all():
+                raise RuntimeError(f'fill_gaps produced nonfinite {name} parameters')
         command(self.binaries['atm_sim_2d'],
                 [par.name, 'height', 'a0_filled', 'a1_filled', 'atmosphere', '-'], directory)
         return read_float(directory / 'atmosphere', phase.shape), {
             'validPatchFraction': float(good.mean()),
             'maxFillDistance': float(distance.max()), 'phaseShift': shift,
-            'heightShift': height_shift}
+            'heightShift': height_shift, 'gapFillBackend': 'gamma_fill_gaps',
+            'gapFillMethod': 4}
 
 
 def network_matrix(date_pairs):
@@ -299,14 +317,35 @@ def run_correction(stack_file, geometry_file, template, output_file=None, backen
         print('Atmospheric correction report:', work / 'report.json')
 
 
+
+def validate_timeseries_lineage(stack_file, timeseries_file):
+    """Refuse backend correction on raw, stale or differently sourced time series."""
+    with h5py.File(stack_file, 'r') as stack, h5py.File(timeseries_file, 'r') as ts:
+        if ts.attrs.get('mintpy.networkInversion.obsDatasetName') != DATASET:
+            raise ValueError('Backend requires time series inverted from unwrapPhase_atm')
+        if ts.attrs.get('miaplpy.networkInversion.complete') != 'yes':
+            raise ValueError('Corrected-phase time-series inversion is incomplete; rerun invert_network')
+        for key in ('sourceFile', 'sourceDataset', 'report', 'config', 'outputDataset'):
+            name = PREFIX + key
+            if name not in stack.attrs or ts.attrs.get(name) != stack.attrs[name]:
+                raise ValueError(f'Stale / mismatched atmospheric time-series provenance: {name}')
+    print('Verified corrected-phase time-series lineage:', timeseries_file)
+
+
 def main(iargs=None):
     from mintpy.utils import readfile, utils as ut
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('stack')
-    parser.add_argument('--geometry', required=True)
-    parser.add_argument('--template', required=True)
+    parser.add_argument('--geometry')
+    parser.add_argument('--template')
+    parser.add_argument('--check-timeseries', help='Validate backend input provenance only')
     parser.add_argument('--output')
     args = parser.parse_args(iargs)
+    if args.check_timeseries:
+        validate_timeseries_lineage(args.stack, args.check_timeseries)
+        return
+    if not args.geometry or not args.template:
+        parser.error('--geometry and --template are required for correction')
     template = ut.check_template_auto_value(readfile.read_template(args.template))
     if not enabled(template):
         raise ValueError('Set miaplpy.atmosphere.method = gamma to run correction')

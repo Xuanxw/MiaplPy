@@ -810,7 +810,7 @@ class miaplpyTimeSeriesAnalysis(TimeSeriesAnalysis):
 
         if atmosphere_command:
             cmd += ' --dset unwrapPhase_atm'
-        run_commands = [atmosphere_command + cmd]
+        run_commands = ['set -e\n' + atmosphere_command + cmd]
         run_commands = run_commands[0].lstrip()
 
         os.makedirs(self.run_dir, exist_ok=True)
@@ -853,7 +853,14 @@ class miaplpyTimeSeriesAnalysis(TimeSeriesAnalysis):
             '--dir',
             shlex.quote(self.out_dir_network),
         ]))
-        run_commands_ts = [mintpy_command + '\n']
+        run_commands_ts = []
+        if pre_atmosphere:
+            guard = ' '.join(filter(None, [
+                command_prefix, 'python -m miaplpy.pre_inversion_atmosphere',
+                shlex.quote(os.path.join(self.out_dir_network, 'inputs/ifgramStack_atm.h5')),
+                '--check-timeseries', shlex.quote(os.path.join(self.out_dir_network, 'timeseries.h5'))]))
+            run_commands_ts.append('set -e\n' + guard + '\n')
+        run_commands_ts.append(mintpy_command + '\n')
 
         residual_enabled = str(self.template.get(
             'miaplpy.timeseries.residualTropHgt', False

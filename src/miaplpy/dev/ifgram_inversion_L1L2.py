@@ -259,6 +259,11 @@ def run_or_skip(inps):
     print('-'*50)
     print('update mode: ON')
     flag = 'skip'
+    if inps.obsDatasetName == 'unwrapPhase_atm' and os.path.isfile(inps.outfile[0]):
+        with h5py.File(inps.outfile[0], 'r') as output:
+            if output.attrs.get('miaplpy.networkInversion.complete') != 'yes':
+                print('Corrected-phase inversion is incomplete; rerun required.')
+                return 'run'
 
     # check output files vs input dataset
     if not all(os.path.isfile(i) for i in inps.outfile):
@@ -1332,7 +1337,7 @@ def ifgram_inversion_patch(box, ifgram_file=None, wrappedIfgramStack=None, ref_p
 
                 # save result to output matrices
                 ts[:, idx] = tsi.flatten()
-                inv_quality[idx] = inv_quali
+                inv_quality[idx] = np.asarray(inv_quali).item()
                 num_inv_obs[idx] = num_obsi
                 prog_bar.update(i+1, every=200, suffix='{}/{} pixels'.format(i+1, num_pixel2inv_part))
             prog_bar.close()
@@ -1357,7 +1362,7 @@ def ifgram_inversion_patch(box, ifgram_file=None, wrappedIfgramStack=None, ref_p
 
             # save result to output matrices
             ts[:, idx] = tsi.flatten()
-            inv_quality[idx] = inv_quali
+            inv_quality[idx] = np.asarray(inv_quali).item()
             num_inv_obs[idx] = num_obsi
 
             prog_bar.update(i+1, every=200, suffix='{}/{} pixels'.format(i+1, num_pixel2inv))
@@ -1522,6 +1527,8 @@ def ifgram_inversion(inps=None):
 
     # 2.1 metadata
     meta = dict(stack_obj.metadata)
+    if inps.obsDatasetName == 'unwrapPhase_atm':
+        meta['miaplpy.networkInversion.complete'] = 'no'
     for key in configKeys:
         meta[key_prefix+key] = str(vars(inps)[key])
 
@@ -1729,6 +1736,9 @@ def main(iargs=None):
     # Network Inversion
     #if inps.residualNorm == 'L2':
     ifgram_inversion(inps)
+    if inps.obsDatasetName == 'unwrapPhase_atm':
+        with h5py.File(inps.tsFile, 'r+') as output:
+            output.attrs['miaplpy.networkInversion.complete'] = 'yes'
 
     #else:
     #    raise NotImplementedError('L1 norm minimization is not fully tested.')
