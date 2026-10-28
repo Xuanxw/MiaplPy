@@ -459,6 +459,7 @@ class MiaplPyParser:
     def network_inversion_parser():
         parser = argparse.ArgumentParser(description='Convert phase to range time series')
         parser.add_argument('ifgramStackFile', help='interferograms stack file to be inverted')
+        parser.add_argument('--dset', default=None, help='Explicit unwrapped phase dataset')
         parser.add_argument('-d', '--work_dir', type=str, dest='work_dir', required=True,
                             help='Working directory (miaplpy)')
         parser.add_argument('-t', '--template', dest='template_file', type=str, default=None,

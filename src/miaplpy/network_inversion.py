@@ -8,7 +8,7 @@ import datetime
 from mintpy.utils import readfile, utils as ut
 from miaplpy.objects.arg_parser import MiaplPyParser
 from miaplpy.dev import ifgram_inversion_L1L2
-import generate_temporal_coherence
+from miaplpy import generate_temporal_coherence
 
 ############################################################
 
@@ -51,7 +51,10 @@ def main(iargs=None):
     #wrapped_phase_series = os.path.join(miaplpy_dir, 'inverted/phase_series.h5')
     iargs = [inps.ifgramStackFile, '-t', inps.template_file, '--update', '--norm', inps.residualNorm,
              '--tcoh', inps.temp_coh, '--mask-threshold', str(inps.maskThreshold),
-             '--smooth_factor', inps.L1_alpha]   #, '--calc-cov']
+             '--smooth_factor', str(inps.L1_alpha)]   #, '--calc-cov']
+
+    if inps.dset:
+        iargs += ['--dset', inps.dset]
 
     if not inps.minNormVelocity:
         iargs += ['--min-norm-phase']

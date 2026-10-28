@@ -18,6 +18,7 @@ import math
 import datetime
 import subprocess
 import shlex
+from miaplpy.pre_inversion_atmosphere import enabled as atmosphere_enabled
 from mintpy.utils import writefile, readfile, utils as ut
 from mintpy.smallbaselineApp import TimeSeriesAnalysis
 from miaplpy.objects.arg_parser import (
@@ -777,6 +778,21 @@ class miaplpyTimeSeriesAnalysis(TimeSeriesAnalysis):
 
         coh_file = os.path.join(self.workDir, 'inverted/tempCoh_{}'.format(self.template['miaplpy.timeseries.tempCohType']))
         ifgramStack_file = os.path.join(self.out_dir_network, 'inputs/ifgramStack.h5')
+        atmosphere_command = ''
+        if atmosphere_enabled(self.template):
+            os.makedirs(self.run_dir, exist_ok=True)
+            atmosphere_template = os.path.join(self.run_dir, 'atmosphere_effective.cfg')
+            with open(atmosphere_template, 'w') as stream:
+                for key, value in self.template.items():
+                    stream.write(f'{key} = {value}\n')
+            corrected_stack = os.path.join(self.out_dir_network, 'inputs/ifgramStack_atm.h5')
+            atmosphere_command = ' '.join(filter(None, [
+                self.text_cmd.strip("'").strip(), 'python -m miaplpy.pre_inversion_atmosphere',
+                shlex.quote(ifgramStack_file), '--geometry',
+                shlex.quote(os.path.join(self.out_dir_network, 'inputs/geometryRadar.h5')),
+                '--template', shlex.quote(atmosphere_template), '--output',
+                shlex.quote(corrected_stack)])) + '\n'
+            ifgramStack_file = corrected_stack
         cmd = '{} network_inversion.py {} --template {} --temp_coh {} --mask-thres {}  ' \
               '--norm {} --smooth_factor {} --weight-func {} --work_dir {}'.format(self.text_cmd.strip("'"),
                                      ifgramStack_file,
@@ -792,7 +808,9 @@ class miaplpyTimeSeriesAnalysis(TimeSeriesAnalysis):
         if self.template['miaplpy.timeseries.shadowMask']:
             cmd += ' --shadow_mask'
 
-        run_commands = [cmd]
+        if atmosphere_command:
+            cmd += ' --dset unwrapPhase_atm'
+        run_commands = [atmosphere_command + cmd]
         run_commands = run_commands[0].lstrip()
 
         os.makedirs(self.run_dir, exist_ok=True)
@@ -814,6 +832,18 @@ class miaplpyTimeSeriesAnalysis(TimeSeriesAnalysis):
         if self.org_custom_template:
             custom_template = self.org_custom_template
 
+        pre_atmosphere = atmosphere_enabled(self.template)
+        if pre_atmosphere:
+            # Dedicated template avoids changing the user's template or reapplying
+            # troposphere correction to an already corrected observation stack.
+            os.makedirs(self.run_dir, exist_ok=True)
+            effective = os.path.join(self.run_dir, 'mintpy_after_atmosphere.cfg')
+            with open(custom_template) as stream:
+                contents = stream.read()
+            with open(effective, 'w') as stream:
+                stream.write(contents + '\nmintpy.troposphericDelay.method = no\n')
+            custom_template = effective
+
         command_prefix = self.text_cmd.strip("'").strip()
         mintpy_command = ' '.join(filter(None, [
             command_prefix,
@@ -831,6 +861,8 @@ class miaplpyTimeSeriesAnalysis(TimeSeriesAnalysis):
         tropo_method = str(self.template.get(
             'mintpy.troposphericDelay.method', 'auto'
         )).strip().lower()
+        if pre_atmosphere:
+            residual_enabled = False
         if residual_enabled and tropo_method in ('auto', 'pyaps'):
             residual_command = ' '.join(filter(None, [
                 command_prefix,

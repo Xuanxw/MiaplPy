@@ -883,6 +883,15 @@ def read_stack_obs(stack_obj, box, ref_phase, obs_ds_name='unwrapPhase', dropIfg
         raise Exception('No reference value input/found on file!'+
                         ' unwrapped phase is not referenced!')
 
+    # Explicit validity preserves genuine zero phase after atmospheric subtraction.
+    validity_name = obs_ds_name + 'Valid'
+    if validity_name in stack_obj.datasetNames:
+        valid = stack_obj.read(datasetName=validity_name, box=box,
+                               dropIfgram=dropIfgram, print_msg=False).reshape(num_pair, -1)
+        stack_obs[~valid.astype(bool)] = np.nan
+        stack_obs -= np.asarray(ref_phase)[:, None]
+        return stack_obs
+
     # reference unwrapPhase
     for i in range(num_pair):
         mask = stack_obs[i, :] != 0.
@@ -1179,7 +1188,7 @@ def ifgram_inversion_patch(box, ifgram_file=None, wrappedIfgramStack=None, ref_p
 
     # translate zero phase value to nan (no-data value)
     # becuase it's the common filled value used in phase masking
-    if 'phase' in obs_ds_name.lower():
+    if 'phase' in obs_ds_name.lower() and obs_ds_name + 'Valid' not in stack_obj.datasetNames:
         stack_obs[stack_obs == 0.] = np.nan
         print('convert zero value in {} to NaN (no-data value)'.format(obs_ds_name))
 
